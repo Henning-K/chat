@@ -50,9 +50,9 @@ impl ParserHandler for HttpParser {
     }
 }
 
-#[derive(PartialEq)]
+#[derive(Debug)]
 enum ClientState {
-    AwaitingHandshake,
+    AwaitingHandshake(RefCell<Parser<HttpParser>>),
     HandshakeResponse,
     Connected,
 }
@@ -60,33 +60,84 @@ enum ClientState {
 struct WebSocketClient {
     socket: TcpStream,
     headers: Rc<RefCell<HashMap<String, String>>>,
-    http_parser: Parser<HttpParser>,
     interest: EventSet,
     state: ClientState,
+
+    // Add outgoing frames queue:
+    outgoing: Vec<WebSocketFrame>,
 }
 
+extern crate frames;
+
+use frames::*;
+
 impl WebSocketClient {
-    fn read(&mut self) {
+    pub fn read(&mut self) {
+        match self.state {
+            ClientState::AwaitingHandshake(_) => self.read_handshake(),
+            ClientState::Connected => self.read_frame(),
+            _ => {}
+        }
+    }
+
+    fn read_frame(&mut self) {
+        let frame = WebSocketFrame::read(&mut self.socket);
+        match frame {
+            Ok(frame) => {
+                match frame.get_opcode() {
+                    OpCode::TextFrame => {
+                        println!("{:?}", frame);
+                        let reply_frame = WebSocketFrame::from("Hi there!");
+                        self.outgoing.push(reply_frame);
+                    }
+                    OpCode::Ping => {
+                        println!("ping/pong");
+                        self.outgoing.push(WebSocketFrame::pong(&frame));
+                    }
+                    OpCode::ConnectionClose => {
+                        self.outgoing.push(WebSocketFrame::close_from(&frame));
+                    }
+                    _ => {}
+                }
+                self.interest.remove(EventSet::readable());
+                self.interest.insert(EventSet::writable());
+            }
+            Err(e) => println!("error while reading frame: {}", e),
+        }
+    }
+
+    fn read_handshake(&mut self) {
         loop {
             let mut buf = [0; 2048];
             match self.socket.try_read(&mut buf) {
                 Err(e) => {
                     println!("Error while reading socket: {:?}", e);
-                    return
-                },
-                Ok(None) =>
+                    return;
+                }
+                Ok(None) => {
+                    println!("socket has no more bytes.");
                     // Socket buffer has no more bytes.
-                    break,
-                Ok(Some(len)) => {
-                    self.http_parser.parse(&buf[0..len]);
-                    if self.http_parser.is_upgrade() {
+                    break;
+                }
+                Ok(Some(_)) => {
+                    let is_upgrade = if let ClientState::AwaitingHandshake(ref parser_state) =
+                                            self.state {
+                        let mut parser = parser_state.borrow_mut();
+                        parser.parse(&buf);
+                        parser.is_upgrade()
+                    } else {
+                        false
+                    };
+
+                    if is_upgrade {
+                        println!("changing current state to HandshakeResponse.");
                         // Change the current state
                         self.state = ClientState::HandshakeResponse;
 
                         // Change current interest to 'Writable'
                         self.interest.remove(EventSet::readable());
                         self.interest.insert(EventSet::writable());
-
+                        println!("state is HandshakeResponse, interest is Writable");
                         break;
                     }
                 }
@@ -96,30 +147,58 @@ impl WebSocketClient {
 
 
     fn write(&mut self) {
+        // println!("state is {:?}", self.state);
+        match self.state {
+            ClientState::HandshakeResponse => {
+                println!("proceed to writing handshake.");
+                self.write_handshake();
+            }
+            ClientState::Connected => {
+                println!("we are indeed connected.");
+                let mut close_connection = false;
+
+                for frame in self.outgoing.iter() {
+                    if let Err(e) = frame.write(&mut self.socket) {
+                        println!("error on write: {}", e);
+                    }
+
+                    if frame.is_close() {
+                        close_connection = true;
+                    }
+                }
+
+                self.outgoing.clear();
+
+                self.interest.remove(EventSet::writable());
+
+                // Add a 'hup' event if we want to close the connection
+                if close_connection {
+                    self.interest.insert(EventSet::hup());
+                } else {
+                    self.interest.insert(EventSet::readable());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn write_handshake(&mut self) {
+        println!("entered write_handshake body");
         // Get the headers HashMap from the Rc<RefCell<...>> wrapper:
         let headers = self.headers.borrow();
-
-        // Find the header that interests us, and generate the key from its value:
         let response_key = gen_key(&headers.get("Sec-WebSocket-Key").unwrap());
-
-        // We're using special function to format the string.
-        // You can find analogies in many other languages, but in Rust it's
-        // performed at the compile time with the power of macros. We'll discuss it
-        // in the next part sometime.
         let response = fmt::format(format_args!("HTTP/1.1 101 Switching Protocols\r\n\
                                                 Connection: Upgrade\r\n\
                                                 Sec-WebSocket-Accept: {}\r\n\
                                                 Upgrade: websocket\r\n\r\n",
                                                 response_key));
-        // Write the response to the socket:
         self.socket.try_write(response.as_bytes()).unwrap();
-
-        // Change the state:
+        println!("handshake written.");
         self.state = ClientState::Connected;
-
-        // And change the interest back to 'readable()':
+        println!("state is now Connected.");
         self.interest.remove(EventSet::writable());
         self.interest.insert(EventSet::readable());
+        println!("interest is now once again readable.");
     }
 
     fn new(socket: TcpStream) -> WebSocketClient {
@@ -131,18 +210,17 @@ impl WebSocketClient {
             // We're making a first clone of the 'headers' variable to read its
             // contents:
             headers: headers.clone(),
-            http_parser: Parser::request(HttpParser {
-                current_key: None,
-
-                // ... and the second clone to write new headers to it:
-                headers: headers.clone(),
-            }),
 
             // Initial events that interest us
             interest: EventSet::readable(),
 
             // Initial state
-            state: ClientState::AwaitingHandshake,
+            state: ClientState::AwaitingHandshake(RefCell::new(Parser::request(HttpParser {
+                current_key: None,
+                headers: headers.clone(),
+            }))),
+
+            outgoing: Vec::new(),
         }
     }
 }
@@ -169,10 +247,14 @@ impl Handler for WebSocketServer {
              events: EventSet) {
         // Are we dealing with the read event?
         if events.is_readable() {
+            println!("dealing with read event.");
             match token {
                 SERVER_TOKEN => {
                     let client_socket = match self.socket.accept() {
-                        Ok(Some((sock, addr))) => sock,
+                        Ok(Some((sock, addr))) => {
+                            println!("accepted connection from address: {:?}", addr);
+                            sock
+                        }
                         Ok(None) => unreachable!(),
                         Err(e) => {
                             println!("Accept error: {}", e);
@@ -189,6 +271,7 @@ impl Handler for WebSocketServer {
                                         EventSet::readable(),
                                         PollOpt::edge() | PollOpt::oneshot())
                               .unwrap();
+                    println!("registered server in event loop");
                 }
                 token => {
                     let mut client = self.clients.get_mut(&token).unwrap();
@@ -213,6 +296,14 @@ impl Handler for WebSocketServer {
                                   PollOpt::edge() | PollOpt::oneshot())
                       .unwrap();
         }
+
+        // Handle connection hangup:
+        if events.is_hup() {
+            let client = self.clients.remove(&token).unwrap();
+
+            client.socket.shutdown(Shutdown::Both);
+            event_loop.deregister(&client.socket);
+        }
     }
 }
 
@@ -234,5 +325,6 @@ fn main() {
                         EventSet::readable(),
                         PollOpt::edge())
               .unwrap();
+    println!("registered server in main function.");
     event_loop.run(&mut server).unwrap();
 }
